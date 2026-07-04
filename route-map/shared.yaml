@@ -1,0 +1,32 @@
+# route-map/shared.yaml — 跨 Agent 通用规则（安全/脱敏规则）
+# 这些规则会 prepend 到每个 Agent 的 rules 前面，低权重只做提示不拦截路由。
+# hint 字段供 route_engine 返回脱敏提示。
+shared_rules:
+  - type: regex
+    pattern: 密钥
+    weight: 0.3
+    hint: "检测到敏感词「密钥」，请注意不对外泄露密钥信息"
+  - type: regex
+    pattern: api[._]?key
+    weight: 0.3
+    hint: "Detected possible API key, please redact before sharing"
+  - type: regex
+    pattern: password
+    weight: 0.3
+    hint: "Detected reference to password, please ensure no credential leakage"
+  - type: regex
+    pattern: token
+    weight: 0.3
+    hint: "Detected token reference, consider masking before output"
+  - type: regex
+    pattern: secret
+    weight: 0.3
+    hint: "Detected secret reference, please verify no sensitive data exposure"
+  - type: regex
+    pattern: 凭据
+    weight: 0.3
+    hint: "检测到凭据相关词汇，请注意脱敏处理"
+  - type: regex
+    pattern: 密码
+    weight: 0.3
+    hint: "检测到密码相关词汇，请确保不泄露敏感信息"

@@ -1,0 +1,14 @@
+chain_name: pub-chain
+chain_keywords: [上传路由引擎, 发布路由引擎, 更新路由引擎, 发版, 发布文档, 双仓库, release, publish]
+description: "发版流程 — docs-writer 生成完全版+脱敏版文档 → file-ops 上传双仓库"
+owner: docs-writer
+steps:
+  - agent: docs-writer
+    goal: 生成完全版（CHANGELOG-FULL.md）和脱敏版（ROUTE-ENGINE-CHANGELOG.md）两份发布文档
+    keywords: [generate-docs, 生成文档, 发布文档]
+  - agent: file-ops
+    goal: 将完全版文档上传至私有仓库，脱敏版文档上传至公开仓库
+    keywords: [upload, dual-repo, git-push, 上传双仓库]
+chain_step_skills:
+  docs-writer@0: [release-publish]
+  file-ops@1: [git, github-upload]

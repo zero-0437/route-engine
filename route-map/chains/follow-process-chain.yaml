@@ -13,6 +13,10 @@ steps:
       - type: script
         description: "任务切片文件存在"
         verify_command: "test -f task-slice.md"
+  - agent: pm-agent
+    goal: 输出修复方案摘要（改动量+文件+风险），等待用户确认
+    keywords: [fix-summary, confirm, review-plan]
+    interactive: true
   - agent: programmer
     goal: 按拆解结果逐个实现代码
     keywords: [implement, build, execute, code]
@@ -40,7 +44,8 @@ steps:
         verify_command: "test -f architecture_report.md"
 chain_step_skills:
   pm-agent@0: [writing-plans]
-  pm-agent@1: [test-driven-development]
-  pm-agent@2: [requesting-code-review]
-  pm-agent@3: [requesting-code-review, receiving-code-review]
-  pm-agent@4: [architecture-review, codebase-inspection]
+  pm-agent@1: [writing-plans]
+  pm-agent@2: [test-driven-development]
+  pm-agent@3: [requesting-code-review]
+  pm-agent@4: [requesting-code-review, receiving-code-review]
+  pm-agent@5: [architecture-review, codebase-inspection]

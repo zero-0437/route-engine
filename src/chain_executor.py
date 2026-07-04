@@ -195,6 +195,38 @@ def _build_loop_result(step: dict, step_idx: int, context: dict) -> dict:
     }
 
 
+def _should_skip_step(step: dict, state: dict, step_idx: int) -> dict | None:
+    """检查下一步是否应因 retry 计数达到 skip_threshold 而跳过。
+
+    解析 step 中的 skip_threshold（int，默认 0=不跳过），
+    从 state 中获取当前 step 的 retry 计数（spec_retry / quality_retry），
+    若 retry 计数 ≥ skip_threshold，返回 SKIPPED 决策。
+
+    参数:
+        step: 下一步的 chain_def 元素
+        state: 当前状态字典
+        step_idx: 下一步的索引
+
+    返回:
+        SKIPPED 决策字典，或 None（不跳过）
+    """
+    skip_threshold = step.get("skip_threshold", 0)
+    if skip_threshold <= 0:
+        return None  # 不跳过
+
+    spec_retry = state.get("spec_retry", 0)
+    quality_retry = state.get("quality_retry", 0)
+    max_retry = max(spec_retry, quality_retry)
+
+    if max_retry >= skip_threshold:
+        return {
+            "status": "SKIPPED",
+            "step_idx": step_idx,
+            "diagnosis": f"达到 skip_threshold {skip_threshold} 次，跳过",
+        }
+    return None
+
+
 def aggregate_parallel_results(branch_results: list[dict], join_strategy: str) -> dict:
     """聚合并行分支的结果。
 
@@ -403,12 +435,14 @@ def _build_step_result(step: dict, chain_owner: str, step_idx: int,
 
 
 def start_chain(task_id: str, chain_def: list, chain_step_skills: dict, chain_owner: str,
-                report_only: bool = False):
+                report_only: bool = False, dry_run: bool = False):
     """
     start action：封装首次 advance 调用，自动构造 last_result={"status":"init"}。
-    等价于 advance(task_id, chain_def, chain_step_skills, {"status":"init"}, chain_owner, report_only)。
+    等价于 advance(task_id, chain_def, chain_step_skills, {"status":"init"}, chain_owner, report_only, dry_run=dry_run)。
+
+    当 dry_run=True 时：不创建状态文件，直接解析第一步的合法 status 列表并返回。
     """
-    return advance(task_id, chain_def, chain_step_skills, {"status": "init"}, chain_owner, report_only=report_only)
+    return advance(task_id, chain_def, chain_step_skills, {"status": "init"}, chain_owner, report_only=report_only, dry_run=dry_run)
 
 
 def run_chain(task_id: str, chain_agent: str, last_result: dict):
@@ -918,7 +952,8 @@ def _handle_parallel_step(step: dict, chain_owner: str, step_idx: int,
 
 
 def advance(task_id: str, chain_def: list, chain_step_skills: dict,
-            last_result: dict, chain_owner: str = "", report_only: bool = False):
+            last_result: dict, chain_owner: str = "", report_only: bool = False,
+            dry_run: bool = False):
     """
     last_result: 从上一步委托返回的结果 dict
       必有: agent, status
@@ -927,7 +962,34 @@ def advance(task_id: str, chain_def: list, chain_step_skills: dict,
     2) batch 场景: last_result 可含 batch_index 或 batch_complete
     chain_owner: 链所属的 Agent（用于构建 skills key: {owner}@{idx}）
     report_only: 链完成后返回 REPORT_ONLY 状态码而非 DONE
+    dry_run: 为 True 时不加载状态/不修改状态，直接根据 chain_def
+             解析当前 step 的合法 status 列表并返回
     """
+
+    # ── dry-run 模式：不加载/不修改状态，直接返回合法 status 列表 ──
+    if dry_run:
+        dr_step_idx = 0  # 默认 step 0
+        if last_result.get("status") == "init":
+            dr_step_idx = 0
+            if not chain_def:
+                return {"status": "ERROR", "diagnosis": "chain_def 为空数组，无法启动链"}
+        else:
+            # 非 init 调用：尝试从 last_result 推断 step_idx
+            dr_step_idx = last_result.get("step_idx", 0)
+            # 如果 last_result 有 target_step_idx（fix 场景），用那个
+            dr_step_idx = last_result.get("target_step_idx", dr_step_idx)
+
+        if dr_step_idx >= len(chain_def):
+            return {"status": "ERROR", "diagnosis": f"step_idx {dr_step_idx} 超出 chain_def 范围"}
+        dr_step = chain_def[dr_step_idx]
+        dr_goal = dr_step.get("goal", "")
+        dr_type = _infer_step_type(dr_goal) if dr_goal else "tdd"
+        dr_valid = STEP_VALID_STATUSES.get(dr_type, ["DONE", "BLOCKED", "NEEDS_FIX", "NEEDS_CONTEXT"])
+        return {
+            "agent": dr_step.get("agent", ""),
+            "valid_statuses": dr_valid,
+            "step_idx": dr_step_idx,
+        }
 
     # ── 首次调用 ──
     if last_result.get("status") == "init":
@@ -1068,6 +1130,20 @@ def advance(task_id: str, chain_def: list, chain_step_skills: dict,
             step = chain_def[state["current_step"]]
             return _build_step_result(step, chain_owner, state["current_step"], chain_step_skills, state.get("context", {}))
 
+        # ── Skip Threshold 检查：下一步是否应跳过 ──
+        next_step_idx = step_idx + 1
+        if next_step_idx < len(chain_def):
+            next_step = chain_def[next_step_idx]
+            skip_result = _should_skip_step(next_step, state, next_step_idx)
+            if skip_result is not None:
+                # 跳过下一步：将 state 的 current_step 推进到跳过步骤之后，
+                # 主 Agent 收到 SKIPPED 后再次调用 advance 会从下一步继续。
+                state["current_step"] = next_step_idx + 1
+                _save_state(task_id, state)
+                if state["current_step"] >= len(chain_def):
+                    return _build_chain_done_result(state, chain_def_length=len(chain_def))
+                return skip_result
+
         # 正常推进到下一步
         state["current_step"] += 1
         if state["current_step"] >= len(chain_def):
@@ -1112,6 +1188,8 @@ def main():
                         help="从 index.yaml 读取 chain 的 Agent 名 (run action 必填)")
     parser.add_argument("--report_only", action="store_true", default=False,
                         help="链完成后返回 REPORT_ONLY 状态码而非 DONE")
+    parser.add_argument("--dry-run", action="store_true", default=False, dest="dry_run",
+                        help="dry-run 模式：不加载/不修改状态，直接返回当前 step 的合法 status 列表")
     args = parser.parse_args()
 
     # 在 main 入口净化 task_id
@@ -1140,7 +1218,7 @@ def main():
             print(json.dumps({"status": "ERROR", "diagnosis": f"JSON 解析失败: {e}"}, ensure_ascii=False))
             sys.exit(1)
         result = start_chain(args.task_id, chain_def, chain_step_skills, args.chain_owner,
-                             report_only=args.report_only)
+                             report_only=args.report_only, dry_run=args.dry_run)
 
     elif args.action == "run":
         # run: --chain_agent 必填；可选 --last_result（默认 init）
@@ -1197,7 +1275,8 @@ def main():
             print(json.dumps({"status": "ERROR", "diagnosis": f"JSON 解析失败: {e}"}, ensure_ascii=False))
             sys.exit(1)
         result = advance(args.task_id, chain_def, chain_step_skills, last_result,
-                         chain_owner=args.chain_owner, report_only=args.report_only)
+                         chain_owner=args.chain_owner, report_only=args.report_only,
+                         dry_run=args.dry_run)
 
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

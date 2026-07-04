@@ -115,3 +115,20 @@ rules:
     skills:
       - doc-coauthoring
     fuzzy: true
+
+  # ── 路由引擎发布/更新 → 触发 pub-chain ────────────────
+  - type: phrase
+    pattern: 上传路由引擎
+    weight: 1.0
+    skills: []
+    chain_ref: pub-chain
+  - type: phrase
+    pattern: 发布路由引擎
+    weight: 1.0
+    skills: []
+    chain_ref: pub-chain
+  - type: phrase
+    pattern: 更新路由引擎
+    weight: 1.0
+    skills: []
+    chain_ref: pub-chain
