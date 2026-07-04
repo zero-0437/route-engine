@@ -1,86 +1,65 @@
-# Hermes Zero Token Router
+# Route Engine Plugin - 路由引擎插件
 
-> Zero-token routing engine for Hermes Agent — intelligent agent dispatch via route-map, chain execution, and multi-review quality assurance.
+> **Zero-Token Routing and Chain Orchestration Engine for Hermes Agent**
+> 零 Token 路由与链式编排引擎
 
-## Overview
+---
 
-The **Zero Token Router** is a routing and execution framework for [Hermes Agent](https://hermes-agent.nousresearch.com). It enables zero-token-cost dispatch of tasks to specialized agent roles via a declarative route-map, with support for chained multi-agent workflows.
+## What Problems Does It Solve / 解决了什么问题
 
-### Key Components
+### Task Chain Discontinuity / 任务链不连续中断问题
 
-| Component | Path | Description |
-|---|---|---|
-| Route Engine | `src/route_engine.py` | Core routing logic — matches tasks to agents via pattern-based rules |
-| Chain Executor | `src/chain_executor.py` | Multi-step chain execution for sequential agent workflows |
-| Chain Config | `src/chain_config.py` | Configuration loader for chain definitions |
-| Route Logger | `src/route_logger.py` | Structured logging and analytics for route decisions |
+Multi-agent workflows often break mid-way. The Chain Executor state machine solves this:
+- Auto-progression: each step advances to the next, no manual handover
+- Context continuity: steps share context via brief files, not user re-explanation
+- Parallel efficiency: 3-branch dual-review runs simultaneously, O(3) -> O(1)
+- Failure recovery: NEEDS_CONTEXT pause, branch progress collection, rollback paths
 
-### Route Map
+多 Agent 协作管线经常中断。Chain Executor 状态机解决了这个问题：每步自动推进，通过 brief 文件和结果传递共享上下文，三路并行评审，内置暂停和回滚路径。
 
-| Directory | Description |
-|---|---|
-| `route-map/index.yaml` | Master routing index — agent definitions, patterns, and dispatch rules |
-| `route-map/routes/` | Per-agent route configurations (15 agents) |
-| `route-map/chains/` | Multi-agent chain definitions (8 chains) |
+### Zero-Token Routing / 零 Token 路由
 
-### Agents
+Every routing decision costs 0 LLM tokens. Pure local rule matching.
+每一次路由决策消耗 0 LLM token。纯本地规则匹配。
 
-| Agent | File | Purpose |
-|---|---|---|
-| Triage | `routes/triage.yaml` | Initial request classification |
-| Programmer | `routes/programmer.yaml` | Code generation & engineering |
-| Spec Agent | `routes/spec-agent.yaml` | Specification authoring |
-| Docs Writer | `routes/docs-writer.yaml` | Documentation generation |
-| PM Agent | `routes/pm-agent.yaml` | Project management oversight |
-| Prompt Engineer | `routes/prompt-engineer.yaml` | Prompt design & optimization |
-| UI Designer | `routes/ui-designer.yaml` | Interface design |
-| Data Analyst | `routes/data-analyst.yaml` | Data analysis & visualization |
-| Error Analyst | `routes/error-analyst.yaml` | Error analysis & debugging |
-| Reality Checker | `routes/reality-checker.yaml` | Factual verification |
-| Dual Review | `routes/dual-review.yaml` | Collaborative review workflow |
-| Document Processor | `routes/document-processor.yaml` | Document processing |
-| File Ops | `routes/file-ops.yaml` | File operations |
-| Memory Agent | `routes/memory-agent.yaml` | Memory management |
-| Synology Helper | `routes/synology-helper.yaml` | Synology NAS operations |
+### Precise Agent Dispatch / 精准 Agent 路由
 
-### Chains
+Three matching modes (keyword/phrase/regex) + three filters (weight/threshold/priority).
+三种匹配模式 + 三重过滤，每次都精准派到对的 Agent。
 
-| Chain | File | Agents Involved |
-|---|---|---|
-| Triage Chain | `chains/triage-chain.yaml` | Triage → routing decision |
-| Programmer Chain | `chains/programmer-chain.yaml` | Spec → Programmer → Review |
-| Spec Agent Chain | `chains/spec-agent-chain.yaml` | Research → Spec → Review |
-| Dual Review Chain | `chains/dual-review-chain.yaml` | Dual independent review |
-| Research Chain | `chains/research-chain.yaml` | Research → Analysis → Report |
-| Debugger Chain | `chains/debugger-chain.yaml` | Error → Analysis → Fix |
-| Follow Process Chain | `chains/follow-process-chain.yaml` | Process enforcement |
-| Learn Chain | `chains/learn-chain.yaml` | Knowledge acquisition |
+### Universal Chain Orchestration / 通用链式编排
 
-### Changelog
+Five step types: serial, parallel, batch, interactive, loop.
+五种步骤类型覆盖所有工作流模式。
 
-See [CHANGELOG.md](./CHANGELOG.md) for the complete version history.
+---
 
-### Quality Reviews
+## Advantages / 优势
 
-All specifications, architecture, and code have undergone rigorous multi-round review:
+| Advantage | Description |
+|-----------|-------------|
+| Zero Token | Routing never touches LLM, pure local YAML+Python matching |
+| State Machine | Multi-agent collaboration with auto-progression |
+| YAML-Defined | Add/change/delete routes without modifying code |
+| Plugin Architecture | Plugs into Hermes as zero-intrusion plugin |
+| Parallel Execution | Built-in parallel step for concurrent work |
+| Fault Recovery | NEEDS_CONTEXT pause, branch collection, rollback |
+| Sub-millisecond | ~0.4ms per routing decision, 5s timeout fallback |
+| Open Architecture | 12+ built-in agents, freely extensible |
 
-| Review | File |
-|---|---|
-| Spec Review (R1) | `reviews/spec-review.md` |
-| Quality Review (R1) | `reviews/quality-review.md` |
-| Architecture Review (R1) | `reviews/architecture-review.md` |
-| Spec Fix (R2) | `reviews/review-fix.md` |
-| Quality Fix (R2) | `reviews/quality-fix.md` |
-| Architecture Fix (R2) | `reviews/architecture-fix.md` |
-| Final Review (R3) | `reviews/final-review.md` |
-| Final Review 2 (R3) | `reviews/final-review2.md` |
-| Quality Final (R3) | `reviews/quality-final2.md` |
-| Architecture Final (R3) | `reviews/architecture-final2.md` |
+---
 
-### Task Slice
+## Quick Start / 快速开始
 
-See [task-slice.md](./task-slice.md) for the complete task breakdown and implementation plan.
 
-## License
 
-Private repository — internal use only.
+## Repos / 仓库
+
+| Repo | Visibility | Content |
+|------|-----------|---------|
+| zero-0437/hermes-zero-token-router | Private | Full source + production route-map |
+| zero-0437/route-engine-docs | Public | Docs + sanitized source + examples |
+
+---
+*Built for Hermes Agent - Route Smart, Execute Continuously*
+*为 Hermes Agent 构建 - 智能路由，持续执行*
