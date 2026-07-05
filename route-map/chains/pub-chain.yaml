@@ -1,6 +1,6 @@
 chain_name: pub-chain
 mode: orchestrator
-chain_keywords: [上传路由引擎, 发布路由引擎, 发版, 发布文档, 双仓库, release, publish]
+chain_keywords: [上传路由引擎, 发布路由引擎, 更新路由引擎, 发版, 发布文档, 双仓库, release, publish]
 description: "发版流程 — docs-writer 生成完全版+脱敏版文档 → file-ops 上传双仓库"
 owner: docs-writer
 steps:
