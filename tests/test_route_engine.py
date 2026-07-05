@@ -561,3 +561,34 @@ class TestCLI(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+# ══════════════════════════════════════════════════════════════════
+# 10. TestChainMode — mode 字段（orchestrator / stepwise）
+# ══════════════════════════════════════════════════════════════════
+
+class TestChainMode(unittest.TestCase):
+    """Test the 'mode' field returned by chain keyword matching (C-方案)"""
+
+    def test_pub_chain_orchestrator_mode(self):
+        """pub-chain 应返回 mode=orchestrator"""
+        result = route("发布路由引擎")
+        self.assertEqual(result.get("mode"), "orchestrator")
+
+    def test_dual_review_stepwise_mode(self):
+        """dual-review-chain 无显式 mode，应返回默认 stepwise"""
+        result = route("双评审")
+        self.assertEqual(result.get("mode"), "stepwise")
+
+    def test_follow_process_stepwise_mode(self):
+        """follow-process-chain 无显式 mode，应返回默认 stepwise"""
+        result = route("按流程走")
+        self.assertEqual(result.get("mode"), "stepwise")
+
+    def test_default_mode_for_unknown_chain(self):
+        """不存在的链关键词应返回默认 stepwise"""
+        # 走 normal route, 非 chain keyword
+        result = route("审查代码安全性")
+        # 这个不是 chain 匹配，所以 chain/model 字段可能不存在
+        # 我们检查如果有 mode 字段则应为 stepwise
+        if "mode" in result:
+            self.assertEqual(result["mode"], "stepwise")
