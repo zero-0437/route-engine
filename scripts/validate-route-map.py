@@ -65,6 +65,11 @@ def _is_near_synonym(a: str, b: str) -> bool:
     b_cjk = _extract_cjk_chars(b)
     if not a_cjk or not b_cjk:
         return False
+
+    # 短文本硬约束：CJK ≤ 3 字符时不判定为近义词
+    if len(a_cjk) <= 3 or len(b_cjk) <= 3:
+        return False
+
     if _is_typo_variant(a, b):
         return True
     if a_cjk in b_cjk or b_cjk in a_cjk:
