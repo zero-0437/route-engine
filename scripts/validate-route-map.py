@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """validate-route-map.py — route-map 目录结构验证器（12 维审计）
 与 validate-skill-map.py 对齐：退出码 0=OK, 1=WARN, 2=ERR
+
+支持 --fix 半自动规则去重合并（dry-run 默认，--apply 实际写入）
 """
 from __future__ import annotations
 
+import argparse
+import copy
 import json
 import os
 import re
@@ -73,6 +77,103 @@ def _is_near_synonym(a: str, b: str) -> bool:
     jaccard = len(set_a & set_b) / len(set_a | set_b)
     len_ratio = min(len(a_cjk), len(b_cjk)) / max(len(a_cjk), len(b_cjk))
     return jaccard >= 0.5 and len_ratio >= 0.5 and len(a_cjk) >= 2 and len(b_cjk) >= 2
+
+
+def _find_redundant_pairs(route_files: dict) -> list:
+    """扫描所有 route 文件，返回冗余规则对列表，已确定 keep/drop。
+
+    每项: (fname, keep_idx, drop_idx, keep_pattern, drop_pattern, weight, skills)
+    keep_idx: 应保留规则的下标（longer/more-specific pattern）
+    drop_idx: 应删除规则的下标（shorter/less-specific pattern）
+    """
+    pairs = []
+    for fname, data in route_files.items():
+        if fname == "shared.yaml":
+            continue
+        rules = data.get("rules", [])
+        # 按 (weight, skills_tuple) 分组
+        groups = {}
+        for i, rule in enumerate(rules):
+            w = rule.get("weight", 0)
+            sk = tuple(sorted(rule.get("skills", []) or []))
+            key = (w, sk)
+            groups.setdefault(key, []).append((i, rule))
+        for key, group in groups.items():
+            if len(group) < 2:
+                continue
+            for a_idx, a_rule in group:
+                for b_idx, b_rule in group:
+                    if a_idx >= b_idx:
+                        continue
+                    pa = a_rule.get("pattern", "")
+                    pb = b_rule.get("pattern", "")
+                    if pa == pb:
+                        continue
+                    if _is_near_synonym(pa, pb):
+                        # 保留 longer/more-specific pattern
+                        # 长度相同保留索引更靠前的
+                        if len(pa) > len(pb) or (len(pa) == len(pb) and a_idx < b_idx):
+                            keep_idx, drop_idx = a_idx, b_idx
+                            keep_pattern, drop_pattern = pa, pb
+                        else:
+                            keep_idx, drop_idx = b_idx, a_idx
+                            keep_pattern, drop_pattern = pb, pa
+                        pairs.append((
+                            fname, keep_idx, drop_idx,
+                            keep_pattern, drop_pattern,
+                            key[0], list(key[1]),
+                        ))
+    return pairs
+
+
+def _dedup_and_generate_patch(route_files: dict, redundant_pairs: list) -> list:
+    """对冗余规则对做去重合并，生成 patch 条目。
+
+    返回 list[dict]，每项:
+    {"file": str, "action": "drop_rule", "index": int, "rule": dict}
+    """
+    patches = []
+    by_file = defaultdict(list)
+    for pair in redundant_pairs:
+        fname = pair[0]
+        by_file[fname].append(pair)
+
+    for fname, file_pairs in by_file.items():
+        data = route_files.get(fname)
+        if data is None:
+            continue
+        rules = data.get("rules", [])
+        drop_indices = set()
+        for pair in file_pairs:
+            drop_indices.add(pair[2])  # drop_idx
+        for idx in sorted(drop_indices, reverse=True):
+            patches.append({
+                "file": fname,
+                "action": "drop_rule",
+                "index": idx,
+                "rule": copy.deepcopy(rules[idx]),
+            })
+    return patches
+
+
+def _apply_patches(route_files: dict, patches: list) -> dict:
+    """将 patches 应用到 route_files（原地修改）。"""
+    by_file = defaultdict(list)
+    for p in patches:
+        by_file[p["file"]].append(p)
+
+    for fname, file_patches in by_file.items():
+        data = route_files.get(fname)
+        if data is None:
+            continue
+        rules = data.get("rules", [])
+        indices = sorted(set(p["index"] for p in file_patches), reverse=True)
+        for idx in indices:
+            if 0 <= idx < len(rules):
+                del rules[idx]
+        data["rules"] = rules
+
+    return route_files
 
 
 def err(msg, field=""):
@@ -228,32 +329,7 @@ def validate():
             seen[key] = i
 
     # 13. 规则冗余度检查（同 weight + 同 skills + 近义词）
-    _redundant_pairs = []
-    for fname, data in route_files.items():
-        if fname == "shared.yaml":
-            continue
-        rules = data.get("rules", [])
-        # 按 (weight, skills_tuple) 分组
-        groups = {}
-        for i, rule in enumerate(rules):
-            w = rule.get("weight", 0)
-            sk = tuple(sorted(rule.get("skills", []) or []))
-            key = (w, sk)
-            groups.setdefault(key, []).append((i, rule))
-        for key, group in groups.items():
-            if len(group) < 2:
-                continue
-            for a_idx, a_rule in group:
-                for b_idx, b_rule in group:
-                    if a_idx >= b_idx:
-                        continue
-                    pa = a_rule.get("pattern", "")
-                    pb = b_rule.get("pattern", "")
-                    if pa == pb:
-                        continue
-                    # 判断是否近义词
-                    if _is_near_synonym(pa, pb):
-                        _redundant_pairs.append((fname, a_idx, b_idx, pa, pb, key[0], list(key[1])))
+    _redundant_pairs = _find_redundant_pairs(route_files)
 
     if _redundant_pairs:
         redund_count = len(_redundant_pairs)
@@ -267,10 +343,11 @@ def validate():
             f"规则冗余度检查: 发现 {redund_count} 对冗余规则（同weight+同skills+近义词），"
             f"占规则对总数 {total_rule_pairs} 的 {ratio:.1f}%",
             "redundancy"))
-        for fname, a_idx, b_idx, pa, pb, w, skills in _redundant_pairs:
+        for pair in _redundant_pairs:
+            fname, keep_idx, drop_idx, keep_pattern, drop_pattern, w, skills = pair
             warnings.append(warn(
-                f"  {fname}: rule[{a_idx}] (\"{pa}\" weight:{w}) ↔ "
-                f"rule[{b_idx}] (\"{pb}\" weight:{w}) 同skills={skills}",
+                f"  {fname}: rule[{drop_idx}] (\"{drop_pattern}\" weight:{w}) → 合并至 "
+                f"rule[{keep_idx}] (\"{keep_pattern}\" weight:{w}) 同skills={skills}",
                 fname))
 
     # 判定状态
@@ -281,12 +358,100 @@ def validate():
     else:
         status = "OK"
 
-    return {"status": status, "errors": errors, "warnings": warnings, "info": infos}
+    return {
+        "status": status,
+        "errors": errors,
+        "warnings": warnings,
+        "info": infos,
+        "_redundant_pairs": _redundant_pairs,
+        "_route_files": route_files,
+    }
+
+
+def _output_fix_suggestions(result: dict, apply_changes: bool):
+    """输出 --fix 去重合并建议，可选 --apply 实际写入文件。"""
+    pairs = result.get("_redundant_pairs", [])
+    route_files = result.get("_route_files", {})
+
+    if not pairs:
+        print("# No redundant pairs found -- nothing to merge.")
+        return
+
+    mode = "applying changes" if apply_changes else "dry-run (no files modified)"
+    print(f"# Semi-Auto Dedup Merge -- {mode}")
+
+    if not apply_changes:
+        print("# To apply: re-run with --fix --apply")
+
+    print(f"\nTotal redundant pairs found: {len(pairs)}")
+
+    patches = _dedup_and_generate_patch(route_files, pairs)
+
+    if not patches:
+        print("\nNo patches generated.")
+        return
+
+    total_actions = len(pairs)
+    print(f"\n## Suggested merges ({total_actions} actions):\n")
+
+    for action_num, pair in enumerate(pairs, 1):
+        fname, keep_idx, drop_idx, keep_pattern, drop_pattern, w, skills = pair
+        print(f"### {action_num}. [{fname}] rule[{keep_idx}] <- rule[{drop_idx}]")
+        print(f"- Keep: \"{keep_pattern}\" (rule[{keep_idx}], weight: {w}, skills: {skills})")
+        print(f"- Drop: \"{drop_pattern}\" (rule[{drop_idx}], weight: {w}, skills: {skills})")
+        print("- Reason: Near-synonym, same weight+skills")
+
+    # 同一 drop 索引可能被多对冗余指向，实际唯一操作数可能更少
+    if total_actions != len(patches):
+        print(f"# Note: {len(patches)} unique rule drops needed ({total_actions - len(patches)} pairs share the same drop target)")
+
+    if apply_changes:
+        _apply_patches(route_files, patches)
+        by_file = defaultdict(list)
+        for p in patches:
+            by_file[p["file"]].append(p)
+        written = 0
+        for fname, data in route_files.items():
+            if fname == "shared.yaml":
+                continue
+            file_patches = [p for p in patches if p["file"] == fname]
+            if not file_patches:
+                continue
+            fpath = os.path.join(ROUTES_DIR, fname)
+            with open(fpath, "w", encoding="utf-8") as f:
+                yaml.dump(data, f, allow_unicode=True, default_flow_style=False,
+                          sort_keys=False, width=120, indent=2)
+            written += 1
+
+        print(f"\n## Applied: {len(patches)} rules dropped across {written} files\n")
+        for fname, file_patches in by_file.items():
+            dropped_indices = sorted(p["index"] for p in file_patches)
+            print(f"  [{fname}] dropped rule indices: {dropped_indices}")
+
+        print("\nWARNING: Changes written to disk. Re-run without --fix to re-validate.")
+    else:
+        print(f"\n## To apply: pipe this output to a merge script or apply manually")
+        print(f"   re-run with: --fix --apply")
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="route-map directory structure validator (12-dim audit)")
+    parser.add_argument("--fix", action="store_true",
+                        help="semi-auto rule dedup merge: detect redundant rules and output merge suggestions (dry-run by default, no files modified)")
+    parser.add_argument("--apply", action="store_true",
+                        help="apply --fix suggestions to actually modify files (only effective with --fix)")
+    args = parser.parse_args()
+
     result = validate()
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+    if args.fix:
+        _output_fix_suggestions(result, apply_changes=args.apply)
+        print("\n---\n")
+
+    output = {k: v for k, v in result.items() if not k.startswith("_")}
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+
     if result["status"] == "ERR":
         return 2
     elif result["status"] == "WARN":
