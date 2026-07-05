@@ -603,11 +603,10 @@ def route(user_input: str) -> dict:
     route_map = load_route_map()
     normalized = _normalize(user_input)
 
-    # ── 问句跳过路由 ─────────────────────────────────
-    # 如果用户输入以问号结尾，视为提问而非任务，跳过路由
-    # 支持中文问号？和英文问号？
-    stripped = normalized.rstrip()
-    if stripped.endswith('？') or stripped.endswith('?'):
+    # ── 问句/感叹句跳过路由 ────────────────────────────
+    # 如果用户输入含问号或感叹号，视为情绪表达而非任务，跳过路由
+    # 支持中英文问号？? 和感叹号！!
+    if '？' in normalized or '?' in normalized or '！' in normalized or '!' in normalized:
         return {
             "agent": "",
             "confidence": 0.0,
@@ -615,7 +614,7 @@ def route(user_input: str) -> dict:
             "details": {
                 "scores": [],
                 "matched_rules": [],
-                "fallback_reason": "问句跳过路由",
+                "fallback_reason": "检测到问号或感叹号，跳过路由",
             },
             "auto_skills": [],
             "manual_skills": [],
