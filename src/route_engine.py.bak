@@ -1,0 +1,777 @@
+#!/usr/bin/env python3
+"""
+route_engine.py — 纯 Python 路由引擎
+根据用户输入文本，通过关键词/正则/短语匹配路由到对应 Agent。
+"""
+
+import json
+import os
+import re
+import yaml
+
+import sys as _sys
+_SRC_DIR = os.path.normpath(os.path.dirname(os.path.abspath(__file__)))
+if _SRC_DIR not in _sys.path:
+    _sys.path.insert(0, _SRC_DIR)
+del _SRC_DIR, _sys
+
+from chain_config import (
+    ROUTE_MAP_DIR,
+    SKILL_CACHE_FILE,
+    SCRIPT_DIR,
+    load_yaml_safe,
+    load_index,
+)
+
+# ── 模块级缓存 ─────────────────────────────────────
+_route_map_cache: dict | None = None
+_skill_cache: dict | None = None
+
+
+def _clear_cache():
+    """安全清空所有模块级缓存（路由规则 + 技能 + 模糊检测）。"""
+    global _route_map_cache, _skill_cache
+    _route_map_cache = None
+    _skill_cache = None
+
+# ── 模糊匹配常量 ──────────────────────────────────
+FUZZY_OVERLAP_THRESHOLD = 0.6   # keyword 模糊重叠率阈值
+CJK_CHAR_RE = re.compile(r'[\u4e00-\u9fff]')
+CJK_BLOCK_RE = re.compile(r'[\u4e00-\u9fff]+')
+EN_WORD_RE = re.compile(r'[a-z][a-z0-9_]*')
+
+
+# ── 辅助函数 ───────────────────────────────────────────────────────
+
+def _normalize(text: str) -> str:
+    """文本归一化：转小写"""
+    return text.lower()
+
+
+# ══════════════════════════════════════════════════════════════════
+# load_route_map 辅助函数
+# ══════════════════════════════════════════════════════════════════
+
+
+def _load_index() -> tuple[dict, list, dict]:
+    """加载 index.yaml，返回 (defaults, overrides, agents_map)"""
+    index = load_index()
+    if index is None:
+        raise FileNotFoundError(f"route-map 目录不存在: {ROUTE_MAP_DIR}")
+    defaults = index.get("defaults", {})
+    overrides = index.get("overrides", [])
+    agents_map = index.get("agents", {})
+    return defaults, overrides, agents_map
+
+
+def _load_shared_rules() -> list[dict]:
+    """加载 shared.yaml 通用规则"""
+    shared_path = os.path.join(ROUTE_MAP_DIR, "shared.yaml")
+    shared_data = load_yaml_safe(shared_path)
+    if shared_data and isinstance(shared_data, dict):
+        return shared_data.get("shared_rules", []) or []
+    return []
+
+
+def _index_chain_keywords(
+    chain_data: dict,
+    chain_name: str,
+    owner: str,
+    chain_kw_index: dict,
+) -> None:
+    """将单个 chain 的 keywords 加入反向索引"""
+    raw_kws = chain_data.get("chain_keywords", [])
+    for kw in raw_kws:
+        kw_lower = kw.lower().strip()
+        if kw_lower:
+            chain_kw_index.setdefault(kw_lower, []).append({
+                "chain_name": chain_name,
+                "owner": owner,
+                "steps": chain_data.get("steps", []),
+                "chain_step_skills": chain_data.get("chain_step_skills", {}),
+                "report_only": chain_data.get("report_only", False),
+            })
+
+
+def _load_agent_rules(
+    agents_map: dict[str, dict],
+    shared_rules: list[dict],
+    chain_kw_index: dict,
+) -> dict[str, dict]:
+    """加载每个 Agent 的规则文件，返回 {name: agent_data} 字典"""
+    agents: dict[str, dict] = {}
+    for name, info in agents_map.items():
+        file_path = os.path.join(ROUTE_MAP_DIR, info["file"])
+        agent_data = load_yaml_safe(file_path)
+        if agent_data is None:
+            raise FileNotFoundError(f"Agent 规则文件不存在: {file_path}")
+
+        # ── chain / chain_ref 处理（chain_ref 优先） ──
+        chain_ref = info.get("chain_ref")
+        if chain_ref:
+            chain_file = os.path.join(ROUTE_MAP_DIR, "chains", f"{chain_ref}.yaml")
+            chain_data = load_yaml_safe(chain_file)
+            if chain_data:
+                chain = chain_data.get("steps", [])
+                chain_step_skills = chain_data.get("chain_step_skills", {})
+                report_only = chain_data.get("report_only", False)
+                _index_chain_keywords(chain_data, chain_ref, name, chain_kw_index)
+            else:
+                print(f"[WARNING] chain_ref 文件不存在: {chain_file}")
+                chain = []
+                chain_step_skills = {}
+                report_only = False
+        else:
+            chain = info.get("chain", [])
+            chain_step_skills = info.get("chain_step_skills", {})
+            report_only = False
+
+        # prepend shared_rules 到该 Agent 的 rules 前面
+        original_rules = agent_data.get("rules", [])
+        combined_rules = list(shared_rules) + original_rules
+        agents[name] = {
+            "rules": combined_rules,
+            "priority": info.get("priority", 99),
+            "condition": info.get("condition", ""),
+            "chain": chain,
+            "chain_step_skills": chain_step_skills,
+            "report_only": report_only,
+        }
+    return agents
+
+
+def _build_chain_index(chain_kw_index: dict) -> list[dict]:
+    """扫描 chains/ 目录，加载未被 chain_ref 引用的 chain keywords"""
+    chains_dir = os.path.join(ROUTE_MAP_DIR, "chains")
+    if os.path.isdir(chains_dir):
+        for fname in sorted(os.listdir(chains_dir)):
+            if not fname.endswith(".yaml"):
+                continue
+            chain_name = fname.replace(".yaml", "")
+            already_loaded = any(
+                entry.get("chain_name") == chain_name
+                for entries in chain_kw_index.values()
+                for entry in entries
+            )
+            if already_loaded:
+                continue
+            chain_path = os.path.join(chains_dir, fname)
+            chain_data = load_yaml_safe(chain_path)
+            if chain_data is None:
+                continue
+            chain_keywords_raw = chain_data.get("chain_keywords", [])
+            if not chain_keywords_raw:
+                continue
+            owner = chain_data.get("owner", "")
+            if not owner:
+                continue
+            _index_chain_keywords(chain_data, chain_name, owner, chain_kw_index)
+    return [
+        {"pattern": kw, "entries": entries}
+        for kw, entries in chain_kw_index.items()
+    ]
+
+
+def load_route_map() -> dict:
+    """加载 route-map/ 目录下的所有规则，合并为单内存表并缓存"""
+    global _route_map_cache
+    if _route_map_cache is not None:
+        return _route_map_cache
+
+    defaults, overrides, agents_map = _load_index()
+    shared_rules = _load_shared_rules()
+    chain_kw_index: dict = {}
+    agents = _load_agent_rules(agents_map, shared_rules, chain_kw_index)
+    chain_keywords = _build_chain_index(chain_kw_index)
+
+    route_map = {
+        "defaults": defaults,
+        "overrides": overrides,
+        "agents": agents,
+        "chain_keywords": chain_keywords,
+    }
+
+    _route_map_cache = route_map
+    return route_map
+
+
+def _load_skill_cache() -> dict | None:
+    """加载 .skill-cache.json，获取各 Agent 的 L2 auto / L3 manual 技能"""
+    global _skill_cache
+    if _skill_cache is not None:
+        return _skill_cache
+    if not os.path.exists(SKILL_CACHE_FILE):
+        return None
+    try:
+        with open(SKILL_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        _skill_cache = data.get("agents", {})
+        return _skill_cache
+    except (json.JSONDecodeError, Exception):
+        return None
+
+
+def _lookup_skills(agent_name: str) -> tuple[list, list]:
+    """查询指定 Agent 的 L2 auto 和 L3 manual 技能"""
+    cache = _load_skill_cache()
+    if not cache:
+        return [], []
+    agent_data = cache.get(agent_name, {})
+    auto = agent_data.get("auto", [])
+    manual = agent_data.get("manual", [])
+    return auto, manual
+
+
+def _build_skill_owners() -> dict[str, list[str]]:
+    """构建技能→Agent 反向索引
+
+    遍历 .skill-cache.json，将每个技能名映射到拥有它的 Agent 列表。
+    支持共享技能（同技能多 Agent 持有）。
+    """
+    cache = _load_skill_cache()
+    if not cache:
+        return {}
+
+    owners: dict[str, list[str]] = {}
+    for agent_name, data in cache.items():
+        all_skills = list(set(data.get("auto", [])) | set(data.get("manual", [])))
+        for skill in all_skills:
+            if skill not in owners:
+                owners[skill] = []
+            owners[skill].append(agent_name)
+    return owners
+
+
+def _score_skill_matches(text: str, owners: dict[str, list[str]]) -> tuple[dict[str, float], set[str]]:
+    """根据用户输入中提及的技能名，对拥有该技能的 Agent 加分
+
+    返回：(scores, matched_skills)
+    - scores: {agent_name: bonus} — 每个命中技能为 owner 加 0.2
+    - matched_skills: set[str] — 实际命中的技能名（去重）
+    这实现了「技能 → Agent」方向的隐式路由。
+    """
+    normalized = text.lower().strip()
+    scores: dict[str, float] = {}
+    matched: set[str] = set()
+    for skill_name, agent_list in owners.items():
+        # 短纯英文技能名（< 5 字符，全 ASCII 字母）使用 \\b 单词边界匹配，
+        # 避免 "plan" 匹配 "explanation"、"pdf" 匹配 "cpdf" 等误触发。
+        # 对含连字符的技能名、CJK 技能名或长度 >= 5 的技能名仍用 in 子串匹配。
+        if len(skill_name) < 5 and skill_name.isascii() and skill_name.isalpha():
+            if not re.search(rf'\b{re.escape(skill_name.lower())}\b', normalized):
+                continue
+        else:
+            if skill_name.lower() not in normalized:
+                continue
+        matched.add(skill_name)
+        for agent in agent_list:
+            scores[agent] = scores.get(agent, 0.0) + 0.2
+    return scores, matched
+
+
+# ══════════════════════════════════════════════════════════════════
+# 关键词拆解 + 模糊匹配
+# ══════════════════════════════════════════════════════════════════
+
+
+
+def _is_subsequence(chars: list[str], sequence: list[str]) -> bool:
+    """检查 chars 是否按顺序出现在 sequence 中（子序列匹配）。"""
+    i = 0
+    for c in chars:
+        while i < len(sequence) and sequence[i] != c:
+            i += 1
+        if i >= len(sequence):
+            return False
+        i += 1
+    return True
+
+
+def _char_overlap_ratio(pattern: str, input_text: str) -> float:
+    """计算 pattern 汉字在 input 中的覆盖率。"""
+    p_chars = set(CJK_CHAR_RE.findall(pattern))
+    if not p_chars:
+        return 0.0
+    i_chars = set(CJK_CHAR_RE.findall(input_text))
+    if not i_chars:
+        return 0.0
+    return len(p_chars & i_chars) / len(p_chars)
+
+
+def match_fuzzy_phrase(normalized: str, pattern: str) -> bool:
+    """Fuzzy phrase 匹配：中文子序列 + 英文单词精确匹配。"""
+    pattern_lower = pattern.lower()
+
+    # (a) 中文子序列匹配
+    p_cjk = CJK_CHAR_RE.findall(pattern_lower)
+    n_cjk = CJK_CHAR_RE.findall(normalized)
+    if p_cjk:
+        if not _is_subsequence(p_cjk, n_cjk):
+            return False
+
+    # (b) 英文单词匹配（pattern 中的英文词必须在 input 中出现）
+    p_en = set(EN_WORD_RE.findall(pattern_lower))
+    n_en = set(EN_WORD_RE.findall(normalized))
+    for pw in p_en:
+        if pw not in n_en:
+            return False
+
+    return True
+
+
+def match_fuzzy_keyword(normalized: str, pattern: str) -> bool:
+    """Fuzzy keyword 匹配：字符重叠率 >= 阈值。"""
+    pattern_lower = pattern.lower()
+
+    # 纯英文关键字：fallback 到精确匹配
+    if not CJK_CHAR_RE.search(pattern_lower):
+        return pattern_lower in normalized
+
+    # 中英文混合：字符重叠率必须达标
+    ratio = _char_overlap_ratio(pattern_lower, normalized)
+    return ratio >= FUZZY_OVERLAP_THRESHOLD
+
+
+# ══════════════════════════════════════════════════════════════════
+# 规则匹配（exact + fuzzy）
+# ══════════════════════════════════════════════════════════════════
+
+
+def match_rule(normalized: str, rule: dict) -> bool:
+    """根据规则类型匹配文本（支持 fuzzy 扩展）。"""
+    rule_type = rule.get("type", "regex")
+    pattern = rule.get("pattern", "")
+    fuzzy = rule.get("fuzzy", False)
+
+    if rule_type == "regex":
+        if fuzzy:
+            pass  # regex + fuzzy 无意义，静默忽略
+        return bool(re.search(pattern, normalized, re.IGNORECASE))
+    elif rule_type == "phrase":
+        if fuzzy:
+            return match_fuzzy_phrase(normalized, pattern)
+        return pattern.lower() in normalized
+    elif rule_type == "keyword":
+        if fuzzy:
+            return match_fuzzy_keyword(normalized, pattern)
+        return pattern.lower() in normalized
+    else:
+        raise ValueError(f"不支持的规则类型: {rule_type}")
+
+
+def evaluate(text: str, route_map: dict) -> list[tuple[str, float, list[dict]]]:
+    """对文本评估所有 Agent，返回 (agent_name, score, matched_rules) 降序列表
+
+    matched_rules 是命中的原始规则 dict 列表，供调用方直接提取 pattern / skills，
+    避免在调用方再次遍历规则做 match_rule 重复计算。
+
+    负权重语义：
+    - 规则 weight 可以为负数，此时命中该规则会降低该 Agent 的总分。
+    - 如果总分低于 0，会被钳位到 0.0（不会变为负数）。
+    - 负权重让该 Agent 不被选中，但不会让其他 Agent 得分增加。
+    - 这实现了"否定路由"：用少量负权重规则即可屏蔽特定 Agent，
+      而不影响其他 Agent 的评分结果。
+    """
+    normalized = _normalize(text)
+    agents = route_map["agents"]
+    results = []
+
+    for name, data in agents.items():
+        score = 0.0
+        matched = []
+        for rule in data.get("rules", []):
+            if match_rule(normalized, rule):
+                score += rule.get("weight", 0.0)
+                matched.append(rule)
+        if score < 0:
+            score = 0.0
+        results.append((name, score, matched))
+
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
+
+
+def decide(
+    scores: list[tuple[str, float]],
+    route_map: dict,
+    text: str | None = None,
+) -> dict:
+    """根据评分和策略决定路由目标"""
+    defaults = route_map.get("defaults", {})
+    min_confidence = defaults.get("min_confidence", 0.5)
+    fallback_agent = defaults.get("fallback_agent", "pm-agent")
+
+    # 空评分 → llm_fallback
+    if not scores:
+        return {
+            "agent": fallback_agent,
+            "confidence": 0.0,
+            "method": "llm_fallback",
+            "details": {
+                "scores": [],
+                "matched_rules": [],
+                "fallback_reason": "无匹配规则",
+            },
+            "auto_skills": [],
+            "manual_skills": [],
+        }
+
+    top_name, top_score = scores[0]
+
+    # 分数低于阈值 → llm_fallback
+    if top_score < min_confidence:
+        return {
+            "agent": fallback_agent,
+            "confidence": min(top_score, 1.0),
+            "method": "llm_fallback",
+            "details": {
+                "scores": scores,
+                "matched_rules": [],
+                "fallback_reason": f"最高分 {top_score:.2f} < 阈值 {min_confidence}",
+            },
+            "auto_skills": [],
+            "manual_skills": [],
+        }
+
+    # 检查平局
+    tied = [s for s in scores if abs(s[1] - top_score) < 1e-9]
+    if len(tied) > 1:
+        # 平局：按 priority 裁决（数值越小优先级越高）
+        agents = route_map.get("agents", {})
+        best = min(tied, key=lambda x: agents.get(x[0], {}).get("priority", 99))
+        return {
+            "agent": best[0],
+            "confidence": min(top_score, 1.0),
+            "method": "auto_tiebreak",
+            "details": {
+                "scores": scores,
+                "matched_rules": [],
+                "fallback_reason": f"平局裁决: {', '.join(a for a, _ in tied)}",
+            },
+            "auto_skills": [],
+            "manual_skills": [],
+        }
+
+    # 正常自动路由
+    return {
+        "agent": top_name,
+        "confidence": min(top_score, 1.0),
+        "method": "auto",
+        "details": {
+            "scores": scores,
+            "matched_rules": [],
+            "fallback_reason": "",
+        },
+        "auto_skills": [],
+        "manual_skills": [],
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+# route 辅助函数
+# ══════════════════════════════════════════════════════════════════
+
+
+def _try_override(route_map: dict, normalized: str) -> dict | None:
+    """检查 overrides 是否命中，命中则直接返回路由结果（跳过评分）"""
+    overrides = route_map.get("overrides", [])
+    matched_rules = []
+    matched_skills: set[str] = set()
+    for override in overrides:
+        agent_name = override["agent"]
+        for rule in override.get("rules", []):
+            if match_rule(normalized, rule):
+                matched_rules.append(rule.get("pattern", ""))
+                for skill in rule.get("skills", []):
+                    matched_skills.add(skill)
+                auto_skills, cache_manual_skills = _lookup_skills(agent_name)
+                agent_data = route_map.get("agents", {}).get(agent_name, {})
+                chain = agent_data.get("chain", [])
+                chain_step_skills = agent_data.get("chain_step_skills", {})
+                return {
+                    "agent": agent_name,
+                    "confidence": 1.0,
+                    "method": "auto",
+                    "details": {
+                        "scores": [],
+                        "matched_rules": matched_rules,
+                        "fallback_reason": "",
+                    },
+                    "auto_skills": auto_skills,
+                    "manual_skills": sorted(set(matched_skills) | set(cache_manual_skills)),
+                    "chain": chain or None,
+                    "chain_step_skills": chain_step_skills,
+                    "report_only": agent_data.get("report_only", False),
+                }
+    return None
+
+
+def _try_chain_keyword(route_map: dict, normalized: str) -> dict | None:
+    """检查 chain keywords 是否命中，命中则直接返回路由结果"""
+    chain_kw_list = route_map.get("chain_keywords", [])
+    matched_chain_entries = []
+    for item in chain_kw_list:
+        rule = {"type": "phrase", "pattern": item["pattern"], "fuzzy": False}
+        if match_rule(normalized, rule):
+            for entry in item["entries"]:
+                matched_chain_entries.append((item["pattern"], entry))
+    if not matched_chain_entries:
+        return None
+    # 按 keyword 长度降序（最精确优先），再按 owner priority 升序
+    agents = route_map.get("agents", {})
+    matched_chain_entries.sort(key=lambda x: (
+        -len(x[0]),  # keyword length descending
+        agents.get(x[1]["owner"], {}).get("priority", 99)  # priority ascending
+    ))
+    matched_kw, matched_info = matched_chain_entries[0]
+    chain_auto_skills, chain_manual_skills = _lookup_skills(matched_info["owner"])
+    return {
+        "agent": matched_info["owner"],
+        "confidence": 1.0,
+        "method": "chain_keyword",
+        "details": {
+            "scores": [],
+            "matched_rules": [f"chain_keyword:{matched_kw}"],
+            "fallback_reason": "",
+        },
+        "auto_skills": chain_auto_skills,
+        "manual_skills": chain_manual_skills,
+        "chain": matched_info["steps"],
+        "chain_step_skills": matched_info["chain_step_skills"],
+        "report_only": matched_info.get("report_only", False),
+    }
+
+
+def _evaluate_and_decide(
+    user_input: str,
+    normalized: str,
+    route_map: dict,
+) -> dict:
+    """执行 evaluate → 技能加分 → decide，返回完整路由结果"""
+    scored_results = evaluate(user_input, route_map)
+
+    matched_rules = []
+    matched_skills: set[str] = set()
+
+    # ── 技能反向匹配：用户提及技能名 → 对 owner Agent 加分 ──
+    skill_owners = _build_skill_owners()
+    skill_scores, skill_matched = _score_skill_matches(normalized, skill_owners)
+    if skill_scores:
+        new_results = []
+        for name, score, matched in scored_results:
+            bonus = skill_scores.get(name, 0.0)
+            new_results.append((name, score + bonus, matched))
+        new_results.sort(key=lambda x: x[1], reverse=True)
+        scored_results = new_results
+        matched_rules.extend([f"skill:{s}" for s in sorted(skill_matched)])
+
+    scores = [(name, score) for name, score, _ in scored_results]
+    result = decide(scores, route_map, user_input)
+
+    # 从 evaluate 结果提取 winning agent 的匹配规则与技能
+    target = result.get("agent", "")
+    if scored_results and target:
+        for name, score, rules in scored_results:
+            if name == target:
+                for rule in rules:
+                    matched_rules.append(rule.get("pattern", ""))
+                    for skill in rule.get("skills", []):
+                        matched_skills.add(skill)
+                break
+
+    result["details"]["matched_rules"] = matched_rules
+
+    # ── 技能分配与链条提取 ──
+    target = result.get("agent", "")
+    if target:
+        auto_skills, cache_manual_skills = _lookup_skills(target)
+        result["auto_skills"] = auto_skills
+        combined_manual = set(matched_skills) | set(cache_manual_skills)
+        result["manual_skills"] = sorted(combined_manual) if combined_manual else []
+        agent_data = route_map.get("agents", {}).get(target, {})
+        result["chain"] = agent_data.get("chain", [])
+        result["chain_step_skills"] = agent_data.get("chain_step_skills", {})
+        result["report_only"] = agent_data.get("report_only", False)
+
+    # ── 确保置信度在 [0.0, 1.0] 范围内 ──
+    result["confidence"] = min(result.get("confidence", 0.0), 1.0)
+
+    return result
+
+
+def route(user_input: str) -> dict:
+    """
+    主入口：路由用户输入到目标 Agent。
+
+    流程：
+    1. 加载 route-map
+    2. 检查 overrides 是否命中（直接委派，跳过评分）
+    3. 检查 chain keywords 是否命中
+    4. 否则 evaluate → decide
+    """
+    route_map = load_route_map()
+    normalized = _normalize(user_input)
+
+    # ── 问号/感叹号/连续句号跳过路由 ─────────────────────
+    # 问号 ?？ 感叹号 !！ 任意位置出现跳过路由
+    # 连续句号 .. 或  。。（必须同类型，不混排）跳过路由
+    if ('？' in normalized or '?' in normalized
+        or '！' in normalized or '!' in normalized
+        or '..' in normalized or '。。' in normalized):
+        return {
+            "agent": "",
+            "confidence": 0.0,
+            "method": "question",
+            "details": {
+                "scores": [],
+                "matched_rules": [],
+                "fallback_reason": "检测到问号/感叹号/连续句号，跳过路由",
+            },
+            "auto_skills": [],
+            "manual_skills": [],
+        }
+    # ──────────────────────────────────────────────
+
+    # ── 激活的 chain 检测 + 确认词路由 ─────────────────────
+    # 扫描 .shared/ 目录下的 chain checkpoint 文件
+    chain_state = _detect_active_chain()
+    if chain_state is not None:
+        chain_result = _route_chain_input(normalized, chain_state)
+        if chain_result is not None:
+            return chain_result
+    # ──────────────────────────────────────────────
+
+    # 检查 overrides（命中则直接返回）
+    override_result = _try_override(route_map, normalized)
+    if override_result is not None:
+        return override_result
+
+    # 检查 chain keywords（命中则直接返回）
+    chain_kw_result = _try_chain_keyword(route_map, normalized)
+    if chain_kw_result is not None:
+        return chain_kw_result
+
+    # 评估 + 决策
+    return _evaluate_and_decide(user_input, normalized, route_map)
+
+
+# ── Chain 激活检测 + 确认词路由 ──────────────────────────
+_CHAIN_STATE_DIR = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 os.pardir, ".shared")
+)
+
+
+def _detect_active_chain() -> dict | None:
+    """扫描 .shared/ 目录，检测是否有激活的 chain checkpoint。"""
+    if not os.path.isdir(_CHAIN_STATE_DIR):
+        return None
+    for fname in os.listdir(_CHAIN_STATE_DIR):
+        if not fname.startswith("chain-") or not fname.endswith(".json"):
+            continue
+        fpath = os.path.join(_CHAIN_STATE_DIR, fname)
+        try:
+            with open(fpath, "r") as f:
+                state = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        status = state.get("status", "")
+        if status not in ("KILLED", "DONE"):
+            return state
+    return None
+
+
+def _route_chain_input(normalized: str, chain_state: dict) -> dict | None:
+    """根据 chain 激活状态和用户输入，返回路由决策或 None。"""
+    chain_name = chain_state.get("chain_name", "unknown")
+    task_id = chain_state.get("task_id", "")
+
+    if "继续" in normalized or "确认" in normalized:
+        return {
+            "agent": "chain_advance", "confidence": 1.0,
+            "method": "chain_active", "chain_action": "advance",
+            "details": {"matched_rules": [f"chain_active:{chain_name}"],
+                        "chain_task_id": task_id,
+                        "scores": [], "fallback_reason": ""},
+            "auto_skills": [], "manual_skills": [],
+        }
+    if "暂停" in normalized or "等一下" in normalized:
+        return {
+            "agent": "chain_advance", "confidence": 1.0,
+            "method": "chain_active", "chain_action": "pause",
+            "details": {"matched_rules": [f"chain_pause:{chain_name}"],
+                        "chain_task_id": task_id,
+                        "scores": [], "fallback_reason": ""},
+            "auto_skills": [], "manual_skills": [],
+        }
+    if "跳过" in normalized:
+        return {
+            "agent": "chain_advance", "confidence": 1.0,
+            "method": "chain_active", "chain_action": "skip",
+            "details": {"matched_rules": [f"chain_skip:{chain_name}"],
+                        "chain_task_id": task_id,
+                        "scores": [], "fallback_reason": ""},
+            "auto_skills": [], "manual_skills": [],
+        }
+    if "恢复" in normalized or "继续刚才" in normalized:
+        return {
+            "agent": "chain_advance", "confidence": 1.0,
+            "method": "chain_active", "chain_action": "resume",
+            "details": {"matched_rules": [f"chain_resume:{chain_name}"],
+                        "chain_task_id": task_id,
+                        "scores": [], "fallback_reason": ""},
+            "auto_skills": [], "manual_skills": [],
+        }
+    return None
+
+
+# ────────────────────────────────────────────────────────
+
+
+# ── 日志记录已剥离到 route_logger.py ──
+from route_logger import _rotate_log, log_route  # noqa: E402, F401
+
+
+# ── 命令行入口 ─────────────────────────────────────────────────────
+def main(argv: list[str] | None = None) -> None:
+    """CLI 入口：接收用户输入文本，输出路由结果 JSON。
+
+    用法：
+        route_engine.py <用户输入文本>
+        route_engine.py --skills <agent_name>
+    """
+    import argparse
+    import sys
+    import json
+
+    parser = argparse.ArgumentParser(
+        description="路由引擎 — 将用户输入路由到目标 Agent",
+    )
+    parser.add_argument("input", nargs="*", help="用户输入文本")
+    parser.add_argument("--skills", nargs=1, metavar="AGENT",
+                        help="查询 Agent 的技能列表")
+
+    parsed = parser.parse_args(argv if argv is not None else sys.argv[1:])
+
+    if parsed.skills:
+        agent_name = parsed.skills[0]
+        auto, manual = _lookup_skills(agent_name)
+        print(json.dumps({
+            "agent": agent_name,
+            "auto": auto,
+            "manual": manual,
+        }, ensure_ascii=False, indent=2))
+        return
+
+    # 默认路由路径
+    if not parsed.input:
+        parser.print_help()
+        sys.exit(1)
+
+    user_input = " ".join(parsed.input)
+    result = route(user_input)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
